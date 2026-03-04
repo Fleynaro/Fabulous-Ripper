@@ -1,521 +1,543 @@
 // ==UserScript==
-// @name         Sketchfab Model Ripper V5+
-// @version      0.9.1
-// @description  download sketchfab models
-// @author       Risk
+// @name         Sketchfab Model Ripper Refactored
+// @version      2.0.0
+// @description  Извлечение 3D моделей и текстур из Sketchfab Viewer
+// @author       Risk (Refactored by Gemini)
 // @include      /^https?://(www\.)?sketchfab\.com/.*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.1.5/jszip.min.js
 // @require      https://cdnjs.cloudflare.com/ajax/libs/jszip-utils/0.0.2/jszip-utils.min.js
 // @require      https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/1.3.8/FileSaver.js
 // @run-at       document-start
 // @grant        unsafeWindow
-// @grant        GM_download
 // ==/UserScript==
-
-var zip = new JSZip();
-let folder = zip.folder('collection');
-
-var button_dw = false;
-var func_drawGeometry = /(this\._stateCache\.drawGeometry\(this\._graphicContext,t\))/g;
-var fund_drawArrays = /t\.drawArrays\(t\.TRIANGLES,0,6\)/g;
-//var func_renderInto1 = /x\.renderInto\(n,S,y/g;
-var func_renderInto1 = /A\.renderInto\(n,E,R/g; //20 jun 2023 fix
-var func_renderInto2 = /g\.renderInto=function\(e,i,r/g;
-var func_getResourceImage = /getResourceImage:function\(e,t\){/g;
-
-var func_test = /apply:function\(e\){var t=e instanceof r\.Geometry;/g
-
-var addbtnfunc;
 
 (function() {
     'use strict';
-    var window = unsafeWindow;
-    console.log("[UserScript]init", window);
 
+    // --- Глобальные настройки и хранилища ---
+    const win = unsafeWindow;
+    const zip = new JSZip();
+    const folder = zip.folder('collection');
+    
+    // Хранилища для перехваченных данных
+    win.allmodel = [];      // Список моделей (геометрия)
+    const textureCache = {}; // Кеш для URL текстур
+    const texturesToSave = new Set();
+    const zipFiles = {};     // Объекты для финального архива
+    
+    let isButtonAdded = false;
 
-    window.allmodel = [];
-    var saveimagecache2 = {};
-    var objects = {};
+    // --- Регулярные выражения для патчинга оригинального JS Sketchfab ---
+    // Эти выражения ищут точки входа в минимизированном коде движка
+    const PATCH_RULES = {
+        drawGeometry: /(this\._stateCache\.drawGeometry\(this\._graphicContext,t\))/g,
+        drawArrays: /t\.drawArrays\(t\.TRIANGLES,0,6\)/g,
+        renderInto1: /A\.renderInto\(n,E,R/g, // Актуально на 2023-2026
+        renderInto2: /g\.renderInto=function\(e,i,r/g,
+        getResourceImage: /getResourceImage:function\(e,t\){/g
+    };
 
+    const MODEL_SCALE = 0.01
 
-    var saveimage_to_list = function(url,file_name)
-    {
-        if (!saveimagecache2[url])
-        {
-            var mdl = {
-                name: file_name
-            }
+    console.log("[Ripper] Скрипт запущен. Ожидание загрузки ресурсов...");
 
-            saveimagecache2[url] = mdl;
-        }
-    }
+    /**
+     * Создает кнопку скачивания в интерфейсе Sketchfab
+     */
+    const injectDownloadButton = () => {
+        if (isButtonAdded) return;
 
-    addbtnfunc = function() {
-        var p = document.evaluate("//div[@class='titlebar']", document, null, 9, null).singleNodeValue;
-        if(p && !button_dw) {
-            console.log("[UserScript]add btn dwnld");
-            var btn = document.createElement("a");
-            btn.setAttribute("class", "control");
-            btn.innerHTML = "<pre style='color:red;'>DOWNLOAD</pre>";
-            btn.addEventListener("click", dodownload , false);
-            p.appendChild(btn);
-            button_dw = true;
+        // Ищем панель заголовка через XPath
+        const titleBar = document.evaluate("//div[@class='titlebar']", document, null, 9, null).singleNodeValue;
+
+        if (titleBar) {
+            console.log("[Ripper] Панель найдена. Добавляю кнопку...");
+            const btn = document.createElement("a");
+            btn.className = "control";
+            btn.innerHTML = "<pre style='color: #ff4444; font-weight: bold; cursor: pointer;'>DOWNLOAD</pre>";
+            btn.addEventListener("click", startDownloadProcess);
+            titleBar.appendChild(btn);
+            isButtonAdded = true;
         } else {
-            console.log("[UserScript]try add btn later");
-            setTimeout(addbtnfunc, 3000);
+            // Если панель еще не прогрузилась, пробуем снова через 3 сек
+            setTimeout(injectDownloadButton, 3000);
         }
-    }
+    };
 
-    var dodownload = function() {
-        console.log("[UserScript]download");
-        var idx = 0;
-        window.allmodel.forEach(function(obj)
-        {
-            var mdl = {
-                name: "model_"+idx,
-                obj:parseobj(obj)
-            }
-            console.log(mdl);
-            dosavefile(mdl);
-            idx++;
-
-        })
-        PackAll();
-    }
-
-    var PackAll = function ()
-        {
-            for (var obj in objects) {
-                console.log("[UserScript]save file", obj);
-                folder.file(obj, objects[obj], {binary:true});
-              }
-
-            var file_name = document.getElementsByClassName('model-name__label')[0].textContent;
-            folder.generateAsync({ type: "blob" }).then(content => saveAs(content, file_name + ".zip"));
+    /**
+     * Основной процесс сборки файлов и скачивания
+     */
+    const startDownloadProcess = () => {
+        console.log("[Ripper] Сборка модели началась...");
+        
+        if (win.allmodel.length === 0) {
+            alert("Модели не найдены. Попробуйте покрутить модель в просмотрщике.");
+            return;
         }
 
-        var parseobj = function(obj)
-        {
-            console.log("[UserScript]: obj", obj);
-            var list = [];
-            obj._primitives.forEach(function(p) {
-                if(p && p.indices) {
-                    list.push({
-                        'mode' : p.mode,
-                        'indices' : p.indices._elements
-                    });
-                }
-            })
+        if (texturesToSave.size > 0 && !confirm(`Не все текстуры были распознаны:\n${[...texturesToSave].join('\n')}\n\nСкачать все равно?`)) return
 
-            var attr = obj._attributes;
+        const geometryNames = new Set()
+        const materialNames = new Set()
+        win.allmodel.forEach((modelData) => {
+            const geometryName = getUniqueName(getGeometryName(modelData), geometryNames);
+            const materialName = getUniqueName(getMaterialName(modelData), materialNames);
+            geometryNames.add(geometryName);
+            materialNames.add(materialName);
+            console.log(`[Ripper] Обработка части: ${geometryName}`);
+            
+            const parsedMaterialData = parseMaterial(modelData);
+            createMtlFile(materialName, parsedMaterialData);
+
+            const parsedGeometryData = parseGeometry(modelData);
+            createObjFile(geometryName, materialName, parsedGeometryData);
+        });
+
+        packAndSave();
+    };
+
+    const getGeometryName = (data) => {
+        return data?._geometry?._name || data?._parents[0]?._name || data?._name || 'model'
+    }
+
+    const getMaterialName = (data) => {
+        return data?.stateset?._name || data?._parents[0]?._name || 'material'
+    }
+
+    const getUniqueName = (baseName, names = new Set()) => {
+        let uniqueName = baseName;
+        let counter = 1;
+        while (names.has(uniqueName)) {
+            uniqueName = `${baseName}_${counter}`;
+            counter++;
+        }
+        return uniqueName
+    }
+
+    const parseMaterial = (data) => {
+        const channels = (data?.stateset || data._parents[0]?.stateset)?._attributeArray[0]?._object?._activeChannels || []
+        return { channels: channels.map(c => {
+            const attr = c.attributes;
+            const url = attr.textureModel?.attributes?.multiresTexture?._image?._url
             return {
-                vertex: attr.Vertex._elements,
-                normal: attr.Normal ? attr.Normal._elements : [],
-                uv: attr.TexCoord0 ? attr.TexCoord0._elements :
-                attr.TexCoord1 ? attr.TexCoord1._elements :
-                attr.TexCoord2 ? attr.TexCoord2._elements :
-                attr.TexCoord2 ? attr.TexCoord2._elements :
-                attr.TexCoord3 ? attr.TexCoord3._elements :
-                attr.TexCoord4 ? attr.TexCoord4._elements :
-                attr.TexCoord5 ? attr.TexCoord5._elements :
-                attr.TexCoord6 ? attr.TexCoord6._elements :
-                attr.TexCoord7 ? attr.TexCoord7._elements :
-                attr.TexCoord8 ? attr.TexCoord8._elements :  [],
-                primitives: list,
-            };
-        }
-
-        var dosavefile = function(mdl)
-        {
-            var obj = mdl.obj;
-
-            //console.log("TEST");
-            //console.log(obj);
-
-            var str = '';
-            str += 'mtllib ' + mdl.name + '.mtl\n';
-            str += 'o ' + mdl.name + '\n';
-            for (var i = 0; i < obj.vertex.length; i += 3) {
-                str += 'v ';
-                for (var j = 0; j < 3; ++j) {
-                    str += obj.vertex[i + j] + ' ';
-                }
-                str += '\n';
+                name: attr.name,
+                texture: url && textureCache[url].name,
+                factor: attr.factor !== undefined ? attr.factor : 1.0,
+                color: attr.color,
+                enable: attr.enable
             }
-            for (i = 0; i < obj.normal.length; i += 3) {
-                str += 'vn ';
-                for (j = 0; j < 3; ++j) {
-                    str += obj.normal[i + j] + ' ';
-                }
-                str += '\n';
-            }
+        })}
+    };
 
-            for (i = 0; i < obj.uv.length; i += 2) {
-                str += 'vt ';
-                for (j = 0; j < 2; ++j) {
-                    str += obj.uv[i + j] + ' ';
-                }
-                str += '\n';
-            }
-            //str += 'usemtl ' + mdl.name + '\n';
-            str += 's on \n';
+    const createMtlFile = (name, data) => {
+        const channels = data.channels;
+        let mtl = `newmtl ${name}\n`;
 
-            var vn = obj.normal.length != 0;
-            var vt = obj.uv.length != 0;
-
-            for (i = 0; i < obj.primitives.length; ++i) {
-                var primitive = obj.primitives[i];
-                if (primitive.mode == 4 || primitive.mode == 5) {
-                    var strip = (primitive.mode == 5);
-                    for (j = 0; j + 2 < primitive.indices.length; !strip ? j += 3 : j++) {
-                        str += 'f ';
-                        var order = [ 0, 1, 2];
-                        if (strip && (j % 2 == 1)) {
-                            order = [ 0, 2, 1];
-                        }
-                        for (var k = 0; k < 3; ++k)
-                        {
-                            var faceNum = primitive.indices[j + order[k]] + 1;
-                            str += faceNum;
-                            if (vn || vt) {
-                                str += '/';
-                                if (vt) {
-                                    str += faceNum;
-                                }
-                                if (vn) {
-                                    str += '/' + faceNum;
-                                }
-                            }
-                            str += ' ';
-                        }
-                        str += '\n';
+        channels.filter(c => c.enable).forEach(c => {
+            const { texture, factor, color } = c;
+            switch (c.name) {
+                case 'DiffuseColor':
+                case 'DiffuseIntensity':
+                case 'AlbedoPBR':
+                case 'DiffusePBR': {
+                    // Если есть цвет — берем его, если только фактор — делаем серый, иначе белый
+                    const f = (factor !== undefined) ? factor : 1.0;
+                    if (color) {
+                        const r = color[0] * f;
+                        const g = color[1] * f;
+                        const b = color[2] * f;
+                        mtl += `Kd ${r} ${g} ${b}\n`;
+                    } else {
+                        // Если цвета нет, просто используем фактор как серый цвет
+                        mtl += `Kd ${f} ${f} ${f}\n`;
                     }
+                    if (texture) mtl += `map_Kd ${texture}\n`;
+                    break;
                 }
-                else {
-                    console.log("[UserScript]dosavefile: unknown primitive mode", primitive);
+                case 'SpecularColor':
+                case 'SpecularF0':
+                case 'SpecularPBR': {
+                    // SpecularPBR может быть цветным, SpecularF0 обычно просто число
+                    const f = (factor !== undefined) ? factor : 1.0;
+                    if (color) {
+                        const r = color[0] * f;
+                        const g = color[1] * f;
+                        const b = color[2] * f;
+                        mtl += `Ks ${r} ${g} ${b}\n`;
+                    } else {
+                        // Если цвета нет, просто используем фактор как серый цвет
+                        mtl += `Ks ${f} ${f} ${f}\n`;
+                    }
+                    if (texture) mtl += `map_Ks ${texture}\n`;
+                    break;
+                }
+                case 'SpecularHardness':
+                    // Ns в MTL обычно варьируется от 0 до 1000
+                    // Если factor прилетает в диапазоне 0-1, его часто умножают на 100
+                    const nsValue = (factor <= 1.0) ? factor * 100 : factor;
+                    mtl += `Ns ${nsValue}\n`;
+                    break;
+                case 'MetalnessPBR':
+                    mtl += `Pm ${factor}\n`; // Интенсивность металла
+                    if (texture) mtl += `map_Pm ${texture}\n`;
+                    break;
+            
+                case 'RoughnessPBR':
+                    mtl += `Pr ${factor}\n`; // Интенсивность шероховатости
+                    if (texture) mtl += `map_Pr ${texture}\n`;
+                    break;
+
+                case 'GlossinessPBR':
+                    mtl += `Ps ${factor}\n`;
+                    if (texture) mtl += `map_Ps ${texture}\n`;
+                    break;
+
+                case 'SheenPBR':
+                    mtl += `Psh ${factor}\n`;
+                    if (texture) mtl += `map_Psh ${texture}\n`;
+                    break;
+
+                case 'SheenRoughnessPBR':
+                    mtl += `Pshr ${factor}\n`;
+                    break;
+            
+                case 'EmitColor':
+                case 'EmissivePBR': {
+                    const f = (factor !== undefined) ? factor : 1.0;
+                    if (color) {
+                        const r = color[0] * f;
+                        const g = color[1] * f;
+                        const b = color[2] * f;
+                        mtl += `Ke ${r} ${g} ${b}\n`;
+                    } else {
+                        // Если цвета нет, просто используем фактор как серый цвет
+                        mtl += `Ke ${f} ${f} ${f}\n`;
+                    }
+                    if (texture) mtl += `map_Ke ${texture}\n`;
+                    break;
+                }
+                case 'AlphaMask':
+                case 'Opacity':
+                case 'OpacityPBR':
+                case 'Transparency':
+                    mtl += `d ${factor}\n`; // 1.0 - полностью непрозрачный
+                    if (texture) mtl += `map_d ${texture}\n`;
+                    break;
+                
+                case 'ClearcoatPBR':
+                    mtl += `Pc ${factor}\n`;
+                    if (texture) mtl += `map_Pc ${texture}\n`;
+                    break;
+
+                case 'ClearcoatRoughnessPBR':
+                    mtl += `Pcr ${factor}\n`;
+                    if (texture) mtl += `map_Pcr ${texture}\n`;
+                    break;
+
+                case 'HeightMap':
+                case 'DisplacementPBR': {
+                    if (texture) {
+                        const hF = factor ?? 1.0;
+                        mtl += `disp -bm ${hF} ${texture}\n`;
+                    } else {
+                        console.warn(`[Ripper] Нет карты высот для материала "${name}"`);
+                        alert(`[Ripper] Нет карты высот для материала "${name}"`)
+                    }
+                    break;
+                }
+            
+                case 'NormalMap':
+                case 'BumpMap': {
+                    if (texture) {
+                        const nF = (factor !== undefined) ? factor : 1.0;
+                        mtl += `map_Bump -bm ${nF} ${texture}\n`;
+                    } else {
+                        console.warn(`[Ripper] Нет карты нормалей для материала "${name}"`);
+                        alert(`[Ripper] Нет карты нормалей для материала "${name}"`)
+                    }
+                    break;
+                }
+        
+                case 'AOPBR': {
+                    if (texture) {
+                        mtl += `map_Ka ${texture}\n`;
+                    } else {
+                        console.warn(`[Ripper] Нет карты AO для материала "${name}"`);
+                        alert(`[Ripper] Нет карты AO для материала "${name}"`)
+                    }
+                    break;
+                }
+
+                default: {
+                    console.warn(`[Ripper] Неизвестный канал "${c.name}" для материала "${name}"`);
+                    alert(`[Ripper] Неизвестный канал "${c.name}" для материала "${name}"`);
                 }
             }
+        });
 
-            str += '\n';
-
-            var objblob = new Blob([str], {type:'text/plain'});
-
-            objects[mdl.name+".obj"] = objblob;
+        if (mtl.includes('undefined')) {
+            alert(`[Ripper] Некорректные данные для материала "${name}":\n${mtl}`);
+            throw new Error(`[Ripper] Некорректные данные для материала "${name}"`);
         }
 
+        zipFiles[`${name}.mtl`] = new Blob([mtl], { type: 'text/plain' });
+        console.log(`[Ripper] MTL файл создан: ${name}.mtl`);
+    };
 
-        window.attachbody = function(obj)
-        {
-             if(obj._faked != true && ((obj.stateset && obj.stateset._name) || obj._name || (obj._parents && obj._parents[0]._name)) ) {
-                 obj._faked = true;
-                 if(obj._name == "composer layer" || obj._name == "Ground - Geometry") return;
-                 window.allmodel.push(obj)
-                 console.log(obj);
-             }
-            //console.log(obj);
-        }
-
-
-        window.hook_test = function(e, idx)
-        {
-            console.log("hooked index: "+idx);
-            console.log(e);
-        }
-        window.drawhookcanvas = function(e, imagemodel)
-        {
-
-            if((e.width == 128 && e.height == 128) || (e.width == 32 && e.height == 32) || (e.width == 64 && e.height == 64))
-            {
-                return e;
-            }
-            if(imagemodel)
-            {
-                var alpha = e.options.format;
-                var filename_image =  imagemodel.attributes.name;
-                var uid = imagemodel.attributes.uid;
-                var url_image = e.url;
-                var max_size = 0;
-                var obr = e;
-                imagemodel.attributes.images.forEach(function(img)
-                {
-                    var alpha_is_check = alpha == "A" ? img.options.format == alpha : true;
-
-                    var d = img.width;
-                    while ( d % 2 == 0 )
-                    {
-                        d = d / 2;
-                    }
-
-                    if(img.size > max_size && alpha_is_check && d == 1)
-                    {
-                        max_size = img.size;
-                        url_image = img.url;
-                        uid = img.uid;
-                        obr = img;
-                    }
+    /**
+     * Парсинг сырых данных геометрии Sketchfab в удобный формат
+     */
+    const parseGeometry = (data) => {
+        const primitives = [];
+        data._primitives.forEach(p => {
+            if (p && p.indices) {
+                primitives.push({
+                    mode: p.mode,
+                    indices: p.indices._elements
                 });
-                if(!saveimagecache2[url_image])
-                {
-                    console.log(e);
-                    saveimage_to_list(url_image, filename_image);
-                }
-                else
-                {
-                    //console.log(e);
-                }
-
-                return obr;
             }
-            return e;
+        });
+
+        const attr = data._attributes;
+        return {
+            vertex: attr.Vertex._elements,
+            normal: attr.Normal ? attr.Normal._elements : [],
+            uv: extractUV(attr),
+            primitives: primitives
+        };
+    };
+
+    /**
+     * Поиск доступных UV-координат (проверяет слоты от 0 до 8)
+     */
+    const extractUV = (attr) => {
+        for (let i = 0; i <= 8; i++) {
+            const key = `TexCoord${i}`;
+            if (attr[key]) return attr[key]._elements;
+        }
+        return [];
+    };
+
+    /**
+     * Конвертация геометрии в формат .OBJ
+     */
+    const createObjFile = (name, materialName, data) => {
+        let objContent = `mtllib ${materialName}.mtl\no ${name}\n`;
+
+        // Вершины (v x y z)
+        for (let i = 0; i < data.vertex.length; i += 3) {
+            objContent += `v ${data.vertex[i] * MODEL_SCALE} ${data.vertex[i+1] * MODEL_SCALE} ${data.vertex[i+2] * MODEL_SCALE}\n`;
         }
 
-        window.drawhookimg = function(gl,t)
-        {
-            console.log(JSON.stringify(t));
-            var url = t[5].currentSrc;
-            var width = t[5].width;
-            var height = t[5].height;
-
-            if(!saveimagecache2[url])
-            {
-                //console.log("rejected:"+url);
-                return;
-            }
-            else
-            {
-                //console.log("saved texture:"+url);
-            }
-
-
-            var data = new Uint8Array(width * height * 4);
-            gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, data);
-
-            var halfHeight = height / 2 | 0;  // the | 0 keeps the result an int
-            var bytesPerRow = width * 4;
-
-            // make a temp buffer to hold one row
-            var temp = new Uint8Array(width * 4);
-            for (var y = 0; y < halfHeight; ++y)
-            {
-            var topOffset = y * bytesPerRow;
-            var bottomOffset = (height - y - 1) * bytesPerRow;
-
-            // make copy of a row on the top half
-            temp.set(data.subarray(topOffset, topOffset + bytesPerRow));
-
-            // copy a row from the bottom half to the top
-            data.copyWithin(topOffset, bottomOffset, bottomOffset + bytesPerRow);
-
-            // copy the copy of the top half row to the bottom half
-            data.set(temp, bottomOffset);
-            }
-
-             // Create a 2D canvas to store the result
-            var canvas = document.createElement('canvas');
-            canvas.width = width;
-            canvas.height = height;
-            var context = canvas.getContext('2d');
-
-            // Copy the pixels to a 2D canvas
-            var imageData = context.createImageData(width, height);
-            imageData.data.set(data);
-            context.putImageData(imageData, 0, 0);
-
-            var re = /(?:\.([^.]+))?$/;
-            var ext = re.exec(saveimagecache2[url].name)[1];
-            var name = saveimagecache2[url].name+".png";
-
-            if(ext == "png" || ext == "jpg" || ext == "jpeg")
-            {
-                var ret = saveimagecache2[url].name.replace('.'+ext,'');
-                name = ret+".png";
-            }
-            console.log("saved texture to blob "+name);
-            canvas.toBlob(function(blob){objects[name] = blob;},"image/png");
+        // Нормали (vn x y z)
+        for (let i = 0; i < data.normal.length; i += 3) {
+            objContent += `vn ${data.normal[i]} ${data.normal[i+1]} ${data.normal[i+2]}\n`;
         }
+
+        // UV-координаты (vt u v)
+        for (let i = 0; i < data.uv.length; i += 2) {
+            objContent += `vt ${data.uv[i]} ${data.uv[i+1]}\n`;
+        }
+
+        objContent += 's on\n';
+        objContent += `usemtl ${materialName}\n`;
+
+        const hasNormals = data.normal.length > 0;
+        const hasUV = data.uv.length > 0;
+
+        // Грани (f v/vt/vn)
+        data.primitives.forEach(prim => {
+            if (prim.mode === 4 || prim.mode === 5) { // TRIANGLES или TRIANGLE_STRIP
+                const isStrip = (prim.mode === 5);
+                for (let j = 0; j + 2 < prim.indices.length; !isStrip ? j += 3 : j++) {
+                    let order = [0, 1, 2];
+                    if (isStrip && (j % 2 === 1)) order = [0, 2, 1];
+
+                    let faceLine = 'f ';
+                    order.forEach(k => {
+                        const idx = prim.indices[j + k] + 1;
+                        faceLine += idx;
+                        if (hasUV || hasNormals) {
+                            faceLine += '/';
+                            if (hasUV) faceLine += idx;
+                            if (hasNormals) faceLine += '/' + idx;
+                        }
+                        faceLine += ' ';
+                    });
+                    objContent += faceLine + '\n';
+                }
+            }
+        });
+
+        zipFiles[`${name}.obj`] = new Blob([objContent], { type: 'text/plain' });
+        console.log(`[Ripper] OBJ файл создан: ${name}.obj`);
+    };
+
+    /**
+     * Финальная упаковка всех файлов в ZIP
+     */
+    const packAndSave = () => {
+        console.log("[Ripper] Формирование ZIP-архива...");
+        
+        Object.keys(zipFiles).forEach(fileName => {
+            folder.file(fileName, zipFiles[fileName], { binary: true });
+        });
+
+        // Пытаемся взять имя модели со страницы
+        const modelNameLabel = document.getElementsByClassName('model-name__label')[0];
+        const zipName = (modelNameLabel ? modelNameLabel.textContent : 'sketchfab_model') + ".zip";
+
+        folder.generateAsync({ type: "blob" }).then(content => {
+            saveAs(content, zipName);
+            console.log(`[Ripper] Успешно сохранено: ${zipName}`);
+        });
+    };
+
+    // --- Функции-хуки (вызываются из пропатченного кода Sketchfab) ---
+
+    win.attachbody = (obj) => {
+        // Фильтруем ненужные объекты (земля, служебные слои)
+        if (!obj._faked && (obj._name || (obj.stateset && obj.stateset._name) || (obj._parents && obj._parents[0]._name))) {
+            if (obj._name === "composer layer" || obj._name === "Ground - Geometry") return;
+            
+            obj._faked = true; // Метка, чтобы не дублировать
+            win.allmodel.push(obj);
+            console.log(`[Ripper] Захвачена геометрия: ${getGeometryName(obj)}`, obj);
+        }
+    };
+
+    win.drawhookcanvas = (imgData, imageModel) => {
+        if (!imageModel) return imgData;
+        
+        const attributes = imageModel.attributes;
+        const fileName = attributes.name;
+        
+        if (!textureCache[imgData.url]) {
+            const name = fileName.replace(/\.(png|jpg|jpeg)$/i, '') + ".png"
+            textureCache[imgData.url] = { name, origName: fileName, width: imgData.width, height: imgData.height };
+            texturesToSave.add(name)
+            console.log(`[Ripper] Найдена текстура: ${fileName} (${imgData.width}x${imgData.height})`);
+            console.log(`[Ripper] URL: ${imgData.url}`);
+        }
+        return imgData;
+    };
+
+    win.drawhookimg = (gl, textureInfo) => {
+        const url = textureInfo[5].currentSrc;
+        if (!textureCache[url]) {
+            console.log(`[Ripper] Текстура не распознана: ${url} (${textureInfo[5].width}x${textureInfo[5].height})`);
+            return;
+        }
+        const { name, width, height } = textureCache[url]
+
+        // Проверяем, что нет такой же текстуры, но с большим размером
+        if (Object.values(textureCache).some(t => t.name === name && t.width > width)) return;
+
+        const data = new Uint8Array(width * height * 4);
+        
+        // Читаем пиксели прямо из WebGL контекста
+        gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, data);
+
+        // WebGL читает снизу вверх, нужно перевернуть изображение по вертикали
+        const halfHeight = (height / 2) | 0;
+        const bytesPerRow = width * 4;
+        const tempRow = new Uint8Array(bytesPerRow);
+
+        for (let y = 0; y < halfHeight; ++y) {
+            const top = y * bytesPerRow;
+            const bottom = (height - y - 1) * bytesPerRow;
+            tempRow.set(data.subarray(top, top + bytesPerRow));
+            data.copyWithin(top, bottom, bottom + bytesPerRow);
+            data.set(tempRow, bottom);
+        }
+
+        // Рисуем на временный canvas для получения PNG
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        const imgData = ctx.createImageData(width, height);
+        imgData.data.set(data);
+        ctx.putImageData(imgData, 0, 0);
+        
+        canvas.toBlob(blob => {
+            zipFiles[name] = blob;
+            texturesToSave.delete(name);
+            console.log(`[Ripper] Текстура готова к упаковке: ${name} (${width}x${height})`);
+        }, "image/png");
+    };
+
+    // --- Система перехвата скриптов (Injection Engine) ---
+
+    const setupScriptInterception = () => {
+        const observer = new MutationObserver((mutations) => {
+            for (const m of mutations) {
+                for (const node of m.addedNodes) {
+                    if (node.tagName === "SCRIPT" && node.src) {
+                        const isViewerScript = node.src.includes("web/dist/") || node.src.includes("standaloneViewer");
+                        
+                        if (isViewerScript) {
+                            console.log(`[Ripper] Перехват скрипта: ${node.src}`);
+                            applyPatchesToScript(node);
+                        }
+                    }
+                }
+            }
+        });
+
+        observer.observe(document, { childList: true, subtree: true });
+    };
+
+    const applyPatchesToScript = (scriptNode) => {
+        // Останавливаем оригинальный скрипт
+        const originalSrc = scriptNode.src;
+        scriptNode.type = 'text/ignored'; 
+        
+        // Загружаем его вручную
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', originalSrc, false); // Синхронно, чтобы не нарушить порядок загрузки
+        xhr.send('');
+
+        let jsCode = xhr.responseText;
+
+        // Применяем патчи через замену строк
+        // Patch 0 & 1: Инъекция переменных для данных изображений
+        if (PATCH_RULES.renderInto1.test(jsCode)) {
+            jsCode = jsCode.replace(PATCH_RULES.renderInto1, (match) => match + ",i");
+            console.log("[Ripper] Патч 0 (renderInto) применен");
+        }
+
+        if (PATCH_RULES.renderInto2.test(jsCode)) {
+            jsCode = jsCode.replace(PATCH_RULES.renderInto2, (match) => match + ",image_data");
+            console.log("[Ripper] Патч 1 (image_data) применен");
+        }
+
+        // Patch 2: Хук на отрисовку текстур
+        if (PATCH_RULES.drawArrays.test(jsCode)) {
+            jsCode = jsCode.replace(PATCH_RULES.drawArrays, (match) => match + ",window.drawhookimg(t,image_data)");
+            console.log("[Ripper] Патч 2 (drawhookimg) применен");
+        }
+
+        // Patch 3: Хук на получение ресурсов (Canvas)
+        if (PATCH_RULES.getResourceImage.test(jsCode)) {
+            jsCode = jsCode.replace(PATCH_RULES.getResourceImage, (match) => match + "e = window.drawhookcanvas(e,this._imageModel);");
+            console.log("[Ripper] Патч 3 (drawhookcanvas) применен");
+        }
+
+        // Patch 4: Хук на захват геометрии
+        if (PATCH_RULES.drawGeometry.test(jsCode)) {
+            jsCode = jsCode.replace(PATCH_RULES.drawGeometry, (match) => match + ";window.attachbody(t);");
+            console.log("[Ripper] Патч 4 (attachbody) применен");
+            setTimeout(injectDownloadButton, 3000);
+        }
+
+        // Создаем новый скрипт с модифицированным кодом
+        const patchedScript = document.createElement('script');
+        patchedScript.type = "text/javascript";
+        patchedScript.text = jsCode;
+        document.head.appendChild(patchedScript);
+    };
+
+    setupScriptInterception();
 
 })();
-
-(() => {
-            "use strict";
-            const Event = class {
-                constructor(script, target) {
-                    this.script = script;
-                    this.target = target;
-
-                    this._cancel = false;
-                    this._replace = null;
-                    this._stop = false;
-                }
-
-                preventDefault() {
-                    this._cancel = true;
-                }
-                stopPropagation() {
-                    this._stop = true;
-                }
-                replacePayload(payload) {
-                    this._replace = payload;
-                }
-            };
-
-            let callbacks = [];
-            window.addBeforeScriptExecuteListener = (f) => {
-                if (typeof f !== "function") {
-                    throw new Error("Event handler must be a function.");
-                }
-                callbacks.push(f);
-            };
-            window.removeBeforeScriptExecuteListener = (f) => {
-                let i = callbacks.length;
-                while (i--) {
-                    if (callbacks[i] === f) {
-                        callbacks.splice(i, 1);
-                    }
-                }
-            };
-
-            const dispatch = (script, target) => {
-                if (script.tagName !== "SCRIPT") {
-                    return;
-                }
-
-                const e = new Event(script, target);
-
-                if (typeof window.onbeforescriptexecute === "function") {
-                    try {
-                        window.onbeforescriptexecute(e);
-                    } catch (err) {
-                        console.error(err);
-                    }
-                }
-
-                for (const func of callbacks) {
-                    if (e._stop) {
-                        break;
-                    }
-                    try {
-                        func(e);
-                    } catch (err) {
-                        console.error(err);
-                    }
-                }
-
-                if (e._cancel) {
-                    script.textContent = "";
-                    script.remove();
-                } else if (typeof e._replace === "string") {
-                    script.textContent = e._replace;
-                }
-            };
-            const observer = new MutationObserver((mutations) => {
-                for (const m of mutations) {
-                    for (const n of m.addedNodes) {
-                        dispatch(n, m.target);
-                    }
-                }
-            });
-            observer.observe(document, {
-                childList: true,
-                subtree: true,
-            });
-        })();
-
-(() => {
-            "use strict";
-
-            window.onbeforescriptexecute = (e) => {
-                var links_as_arr = Array.from(e.target.childNodes);
-
-                links_as_arr.forEach(function(srimgc)
-                {
-                    if(srimgc instanceof HTMLScriptElement)
-                    {
-                        if (srimgc.src.indexOf("web/dist/") >= 0 || srimgc.src.indexOf("standaloneViewer") >= 0)
-                        {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            var req = new XMLHttpRequest();
-                            req.open('GET', srimgc.src, false);
-                            req.send('');
-                            var jstext = req.responseText;
-                            var ret = func_renderInto1.exec(jstext);
-
-                            if (ret)
-                            {
-                                var index = ret.index + ret[0].length;
-                                var head = jstext.slice(0, index);
-                                var tail = jstext.slice(index);
-                                jstext = head + ",i" + tail;
-                                console.log("[UserScript] Injection: patch_0 injected successful " + srimgc.src);
-                            }
-
-                            ret = func_renderInto2.exec(jstext);
-
-                            if (ret)
-                            {
-                                var index = ret.index + ret[0].length;
-                                var head = jstext.slice(0, index);
-                                var tail = jstext.slice(index);
-                                jstext = head + ",image_data" + tail;
-                                console.log("[UserScript] Injection: patch_1 injected successful " + srimgc.src);
-                                if (!func_renderInto1.exec(jstext))
-                                     console.log("[UserScript] But patch_0 failed " + srimgc.src);
-                            }
-
-                            ret = fund_drawArrays.exec(jstext);
-
-                            if (ret)
-                            {
-                                var index = ret.index + ret[0].length;
-                                var head = jstext.slice(0, index);
-                                var tail = jstext.slice(index);
-                                jstext = head + ",window.drawhookimg(t,image_data)" + tail;
-                                console.log("[UserScript] Injection: patch_2 injected successful " + srimgc.src);
-                            }
-
-                            ret = func_getResourceImage.exec(jstext);
-
-                            if (ret)
-                            {
-                                var index = ret.index + ret[0].length;
-                                var head = jstext.slice(0, index);
-                                var tail = jstext.slice(index);
-                                jstext = head + "e = window.drawhookcanvas(e,this._imageModel);" + tail;
-                                console.log("[UserScript] Injection: patch_3 injected successful " + srimgc.src);
-                            }
-
-                            ret = func_drawGeometry.exec(jstext);
-
-                            if (ret)
-                            {
-                                var index1 = ret.index + ret[1].length;
-                                var head1 = jstext.slice(0, index1);
-                                var tail1 = jstext.slice(index1);
-                                jstext = head1 + ";window.attachbody(t);" + tail1;
-                                console.log("[UserScript] Injection: patch_4 injected successful " + srimgc.src);
-                                setTimeout(addbtnfunc, 3000);
-                            }
-                            //ret = func_test.exec(jstext)
-                            var idx = 0;
-                            // while (ret = func_test.exec(jstext))
-                            // {
-                            //     var index = ret.index + ret[0].length;
-                            //     var head = jstext.slice(0, index);
-                            //     var tail = jstext.slice(index);
-                            //     jstext = head +"window.attachbody(e);"+ tail;
-                            //     //jstext = head + "window.drawhook(e);" + tail;
-                            //     func_test.lastIndex = index + 1000;
-                            //     console.log("[UserScript] Injection: patch_4 injected successful" + srimgc.src);
-                            //     setTimeout(addbtnfunc, 3000);
-                            // }
-
-                            var obj = document.createElement('script');
-                            obj.type = "text/javascript";
-                            obj.text = jstext;
-                            document.getElementsByTagName('head')[0].appendChild(obj);
-                        }
-                    }
-                });
-            };
-        })();
