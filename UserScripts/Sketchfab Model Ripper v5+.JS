@@ -129,113 +129,198 @@
         })}
     };
 
+    // Добавлен аргумент zipFiles, чтобы функция была независимой
     const createMtlFile = (name, data) => {
         const channels = data.channels;
         let mtl = `newmtl ${name}\n`;
+        mtl += `illum 7\n`;
 
         channels.filter(c => c.enable).forEach(c => {
             const { texture, factor, color } = c;
-            switch (c.name) {
-                case 'DiffuseColor':
-                case 'DiffuseIntensity':
-                case 'AlbedoPBR':
-                case 'DiffusePBR': {
-                    // Если есть цвет — берем его, если только фактор — делаем серый, иначе белый
-                    const f = (factor !== undefined) ? factor : 1.0;
+            
+            // Приводим все к нижнему регистру, чтобы избежать дублей (ClearCoat vs Clearcoat)
+            const channelName = c.name.replace(/PBR/i, '').toLowerCase();
+
+            switch (channelName) {
+                case 'diffusecolor':
+                case 'diffuseintensity':
+                case 'albedo':
+                case 'diffuse': {
+                    const f = factor ?? 1.0;
                     if (color) {
                         const r = color[0] * f;
                         const g = color[1] * f;
                         const b = color[2] * f;
                         mtl += `Kd ${r} ${g} ${b}\n`;
                     } else {
-                        // Если цвета нет, просто используем фактор как серый цвет
                         mtl += `Kd ${f} ${f} ${f}\n`;
                     }
                     if (texture) mtl += `map_Kd ${texture}\n`;
                     break;
                 }
-                case 'SpecularColor':
-                case 'SpecularF0':
-                case 'SpecularPBR': {
-                    // SpecularPBR может быть цветным, SpecularF0 обычно просто число
-                    const f = (factor !== undefined) ? factor : 1.0;
+
+                case 'specularcolor':
+                case 'specularf0':
+                case 'specular': {
+                    const f = factor ?? 1.0;
                     if (color) {
                         const r = color[0] * f;
                         const g = color[1] * f;
                         const b = color[2] * f;
                         mtl += `Ks ${r} ${g} ${b}\n`;
                     } else {
-                        // Если цвета нет, просто используем фактор как серый цвет
                         mtl += `Ks ${f} ${f} ${f}\n`;
                     }
                     if (texture) mtl += `map_Ks ${texture}\n`;
                     break;
                 }
-                case 'SpecularHardness':
-                    // Ns в MTL обычно варьируется от 0 до 1000
-                    // Если factor прилетает в диапазоне 0-1, его часто умножают на 100
-                    const nsValue = (factor <= 1.0) ? factor * 100 : factor;
+
+                case 'specularhardness': {
+                    // Если factor прилетает в диапазоне 0-1, умножаем на 1000 (стандартный макс. для Ns)
+                    const nsValue = (factor <= 1.0) ? factor * 1000 : factor;
                     mtl += `Ns ${nsValue}\n`;
                     break;
-                case 'MetalnessPBR':
-                    mtl += `Pm ${factor}\n`; // Интенсивность металла
+                }
+
+                case 'metalness': {
+                    mtl += `Pm ${factor ?? 1.0}\n`;
                     if (texture) mtl += `map_Pm ${texture}\n`;
                     break;
-            
-                case 'RoughnessPBR':
-                    mtl += `Pr ${factor}\n`; // Интенсивность шероховатости
+                }
+                
+                case 'roughness': {
+                    mtl += `Pr ${factor ?? 1.0}\n`;
                     if (texture) mtl += `map_Pr ${texture}\n`;
                     break;
+                }
 
-                case 'GlossinessPBR':
-                    mtl += `Ps ${factor}\n`;
+                case 'glossiness': {
+                    mtl += `Ps ${factor ?? 1.0}\n`;
                     if (texture) mtl += `map_Ps ${texture}\n`;
                     break;
+                }
 
-                case 'SheenPBR':
-                    mtl += `Psh ${factor}\n`;
+                case 'clearcoat': {
+                    const f = factor ?? 1.0;
+                    mtl += `Pc ${f}\n`;
+                    
+                    if (c.tint) {
+                        mtl += `Pct ${c.tint[0]} ${c.tint[1]} ${c.tint[2]}\n`;
+                    }
+                    
+                    if (c.reflectivity !== undefined) mtl += `Pcrf ${c.reflectivity}\n`;
+                    if (c.thickness !== undefined) mtl += `Pcth ${c.thickness}\n`;
+                    
+                    if (texture) mtl += `map_Pc ${texture}\n`;
+                    break;
+                }
+                
+                case 'clearcoatroughness': {
+                    mtl += `Pcr ${factor ?? 1.0}\n`;
+                    if (texture) mtl += `map_Pcr ${texture}\n`;
+                    break;
+                }
+                
+                case 'sheen': {
+                    const f = factor ?? 1.0;
+                    if (c.colorFactor) {
+                        const r = c.colorFactor[0] * f;
+                        const g = c.colorFactor[1] * f;
+                        const b = c.colorFactor[2] * f;
+                        mtl += `Psh ${r} ${g} ${b}\n`;
+                    } else {
+                        mtl += `Psh ${f} ${f} ${f}\n`;
+                    }
                     if (texture) mtl += `map_Psh ${texture}\n`;
                     break;
-
-                case 'SheenRoughnessPBR':
-                    mtl += `Pshr ${factor}\n`;
+                }
+                    
+                case 'sheenroughness': {
+                    mtl += `Pshr ${factor ?? 1.0}\n`;
                     break;
+                }
+
+                case 'subsurfacetranslucency': {
+                    // Pss — коэффициент подповерхностного рассеивания
+                    mtl += `Pss ${factor ?? 1.0}\n`;
+                    // Pt — толщина (thickness), влияет на то, как глубоко проходит свет
+                    if (c.thicknessFactor !== undefined) {
+                        mtl += `Pt ${c.thicknessFactor}\n`;
+                    }
+                    if (texture) mtl += `map_Pss ${texture}\n`;
+                    break;
+                }
+
+                case 'subsurfacescattering': {
+                    const f = factor ?? 1.0;
+                    if (color) {
+                        const r = color[0] * f;
+                        const g = color[1] * f;
+                        const b = color[2] * f;
+                        mtl += `Psc ${r} ${g} ${b}\n`;
+                    } else {
+                        mtl += `Psc ${f} ${f} ${f}\n`;
+                    }
+                    if (texture) mtl += `map_Psc ${texture}\n`;
+                    break;
+                }                
             
-                case 'EmitColor':
-                case 'EmissivePBR': {
-                    const f = (factor !== undefined) ? factor : 1.0;
+                case 'emitcolor':
+                case 'emissive': {
+                    const f = factor ?? 1.0;
+
+                    if (c.type === 'additive') {
+                        mtl += `illum 11\n`; 
+                    }
+
                     if (color) {
                         const r = color[0] * f;
                         const g = color[1] * f;
                         const b = color[2] * f;
                         mtl += `Ke ${r} ${g} ${b}\n`;
                     } else {
-                        // Если цвета нет, просто используем фактор как серый цвет
                         mtl += `Ke ${f} ${f} ${f}\n`;
                     }
-                    if (texture) mtl += `map_Ke ${texture}\n`;
+
+                    if (texture) {
+                        const blendMode = (c.type === 'additive') ? '-blend add ' : '';
+                        mtl += `map_Ke ${blendMode}${texture}\n`;
+                    }
                     break;
                 }
-                case 'AlphaMask':
-                case 'Opacity':
-                case 'OpacityPBR':
-                case 'Transparency':
-                    mtl += `d ${factor}\n`; // 1.0 - полностью непрозрачный
-                    if (texture) mtl += `map_d ${texture}\n`;
-                    break;
-                
-                case 'ClearcoatPBR':
-                    mtl += `Pc ${factor}\n`;
-                    if (texture) mtl += `map_Pc ${texture}\n`;
-                    break;
 
-                case 'ClearcoatRoughnessPBR':
-                    mtl += `Pcr ${factor}\n`;
-                    if (texture) mtl += `map_Pcr ${texture}\n`;
-                    break;
+                case 'alphamask':
+                case 'opacity':
+                case 'transparency': {
+                    const f = factor ?? 1.0;
+                    const finalOpacity = c.invert ? (1.0 - f) : f;
 
-                case 'HeightMap':
-                case 'DisplacementPBR': {
+                    mtl += `d ${finalOpacity}\n`; // Основная прозрачность
+                    // Альтернативный параметр прозрачности Tr (используется в некоторых рендерах)
+                    mtl += `Tr ${1.0 - finalOpacity}\n`; 
+
+                    if (c.ior !== undefined) mtl += `Ni ${c.ior}\n`; // Индекс преломления
+                    
+                    if (c.refractionColor) {
+                        mtl += `Ptf ${c.refractionColor[0]} ${c.refractionColor[1]} ${c.refractionColor[2]}\n`;
+                    }
+                    
+                    // ВНИМАНИЕ: Если 'Roughness' тоже передается, Pr запишется дважды. 
+                    // Для прозрачности часто используют Ptr (Transmission Roughness).
+                    if (c.roughnessFactor !== undefined) mtl += `Ptr ${c.roughnessFactor}\n`;
+                    
+                    if (c.thinLayer) mtl += `Ptl 1\n`; 
+
+                    if (texture) {
+                        // Оставил твою логику microsurface, но обычно это map_d
+                        const mapTag = c.useMicrosurfaceTexture ? 'map_Pr' : 'map_d';
+                        mtl += `${mapTag} ${texture}\n`;
+                    }
+                    break;
+                }
+
+                case 'heightmap':
+                case 'displacement': {
                     if (texture) {
                         const hF = factor ?? 1.0;
                         mtl += `disp -bm ${hF} ${texture}\n`;
@@ -246,10 +331,14 @@
                     break;
                 }
             
-                case 'NormalMap':
-                case 'BumpMap': {
+                case 'normalmap':
+                case 'bumpmap': {
                     if (texture) {
-                        const nF = (factor !== undefined) ? factor : 1.0;
+                        const nF = factor ?? 1.0;
+                        // Современные PBR парсеры предпочитают 'norm' для Normal карт, 
+                        // 'map_Bump' исторически использовался для карт высот/бампа. 
+                        // Добавим оба для максимальной совместимости.
+                        mtl += `norm -bm ${nF} ${texture}\n`;
                         mtl += `map_Bump -bm ${nF} ${texture}\n`;
                     } else {
                         console.warn(`[Ripper] Нет карты нормалей для материала "${name}"`);
@@ -257,8 +346,9 @@
                     }
                     break;
                 }
-        
-                case 'AOPBR': {
+                
+                case 'ao':
+                case 'ambientocclusion': {
                     if (texture) {
                         mtl += `map_Ka ${texture}\n`;
                     } else {
@@ -280,8 +370,12 @@
             throw new Error(`[Ripper] Некорректные данные для материала "${name}"`);
         }
 
-        zipFiles[`${name}.mtl`] = new Blob([mtl], { type: 'text/plain' });
+        if (zipFiles) {
+            zipFiles[`${name}.mtl`] = new Blob([mtl], { type: 'text/plain' });
+        }
+        
         console.log(`[Ripper] MTL файл создан: ${name}.mtl`);
+        return mtl; // Возвращаем строку на всякий случай
     };
 
     /**
